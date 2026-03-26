@@ -2,34 +2,44 @@ import dotenv from 'dotenv';
 import express from 'express';
 import cors from 'cors';
 import { Sequelize, DataTypes } from 'sequelize';
+import * as jose from 'jose';
 
 dotenv.config();
-
-const bearerToken = 'Bearer aaa.eyJzdWIiOiIxMjMifQ.bbb'
-const token = bearerToken.slice(7);
-const parts = token.split('.');
-const header = parts[0];
-const payload = parts[1];
-const signature = parts[2];
-
-if (token) {
-  console.log('TOKEN HAS A VALUE');
-} else {
-  console.log('Token has no value');
-}
-
-console.log('Bearer Token:', bearerToken);
-console.log('Token:', token);
-console.log('Header:', header);
-console.log('Payload:', payload);
-console.log('Signature:', signature);
-
-const DB_SCHEMA = process.env.DB_SCHEMA || 'app';
-const useSsl = process.env.PGSSLMODE === 'require';
 
 const app = express();
 app.use(cors())
 app.use(express.json())
+
+const ASGARDEO_ORG = process.env.ASGARDEO_ORG || 'mis372tsecurity';
+const JWKS_URI = `https://api.asgardeo.io/t/${ASGARDEO_ORG}/oauth2/jwks`;
+
+async function authMiddleware(req, res, next) {
+   const authHeader = (req.headers.authorization || '').trim();
+
+  if (!authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing auth', detail: 'Send Authorization: Bearer <access_token>' });
+  }
+
+  const token = authHeader.slice(7).trim();
+  const looksLikeJwt = token && token.split('.').length === 3;
+
+  if (!looksLikeJwt) {
+    return res.status(401).json({ error: 'Access token is not a JWT. In Asgardeo, set your app to use JWT access tokens (Protocol tab).' });
+  }
+
+  try {
+    const JWKS = jose.createRemoteJWKSet(new URL(JWKS_URI));
+    const { payload } = await jose.jwtVerify(token, JWKS);
+    req.userId = payload.sub;
+    return next();
+  } catch (err) {
+    console.error('JWT verification failed:', err.message);
+    return res.status(401).json({ error: 'Invalid or expired token', detail: err.message });
+  }
+}
+
+const DB_SCHEMA = process.env.DB_SCHEMA || 'app';
+const useSsl = process.env.PGSSLMODE === 'require';
 
 const sequelize = new Sequelize(process.env.DB_NAME, process.env.DB_USER, process.env.DB_PASSWORD, {
   host: process.env.DB_HOST,
@@ -56,8 +66,57 @@ const Puppies = sequelize.define('puppies', {
   user_id: { type: DataTypes.STRING(100), allowNull: true },
 }, { schema: DB_SCHEMA, tableName: 'puppies', timestamps: false });
 
-app.get('/', (req, res) => {
-  res.send('Hello World!');
+app.use('/api/puppies', authMiddleware);
+
+app.get('/api/puppies', async (req, res) => {
+  try {
+    const puppies = await Puppies.findAll({ where: { user_id: req.userId } });
+    res.json(puppies);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch puppies', details: err.message });
+  }
+});
+
+app.get('/api/puppies/:id', async (req, res) => {
+  try {
+    const puppy = await Puppies.findOne({ where: { id: req.params.id, user_id: req.userId } });
+    if (!puppy) return res.status(404).json({ error: 'Puppy not found' });
+    res.json(puppy);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch puppy', details: err.message });
+  }
+});
+
+app.post('/api/puppies', async (req, res) => {
+  try {
+    const { name, breed, age } = req.body;
+    const puppy = await Puppies.create({ name, breed, age, user_id: req.userId });
+    res.status(201).json(puppy);
+  } catch (err) {
+    res.status(400).json({ error: 'Failed to create puppy', details: err.message });
+  }
+});
+
+app.put('/api/puppies/:id', async (req, res) => {
+  try {
+    const puppy = await Puppies.findOne({ where: { id: req.params.id, user_id: req.userId } });
+    if (!puppy) return res.status(404).json({ error: 'Puppy not found' });
+    const { name, breed, age, user_id } = req.body;
+    await puppy.update({ name, breed, age, user_id });
+    res.json(puppy);
+  } catch (err) {
+    res.status(400).json({ error: 'Failed to update puppy', details: err.message });
+  }
+});
+
+app.delete('/api/puppies/:id', async (req, res) => {
+  try {
+    const puppy = await Puppies.findOne({ where: { id: req.params.id, user_id: req.userId } });    if (!puppy) return res.status(404).json({ error: 'Puppy not found' });
+    await puppy.destroy();
+    res.json({ message: `Puppy ${req.params.id} deleted successfully` });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete puppy', details: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 5000
